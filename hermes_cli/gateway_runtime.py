@@ -404,9 +404,13 @@ def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path]) -
     return GatewayDiscovery("draining", reason_code="replaced")
 
 
-def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT_ENSURE_TIMEOUT,
+def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = None,
                            idle_exit: bool = False) -> GatewayDiscovery:
     """Ensure once; pending remains pending at deadline.
+
+    ``timeout`` None: :data:`DEFAULT_ENSURE_TIMEOUT`, extended while the pending start's owner keeps
+    burning CPU (a starved host), never past ``gateway_runtime_progress.MAX_ADAPTIVE_TIMEOUT``. An
+    explicit ``timeout`` is a hard deadline (``hermes_cli.gateway_runtime_progress``).
 
     Never installs anything. The one owner it replaces is a gateway an older Hermes left running on
     this install's own home (``incompatible``/``runtime_protocol``, the upgrade case): it is stopped
@@ -427,9 +431,10 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     )
     from hermes_constants import get_default_hermes_root, get_process_hermes_home
 
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("timeout must be finite and positive")
-    deadline = time.monotonic() + timeout
+    from hermes_cli.gateway_launchd_runtime import GatewayJob
+    from hermes_cli.gateway_runtime_progress import StartRunway
+    runway = StartRunway(timeout, DEFAULT_ENSURE_TIMEOUT)
+    deadline = runway.deadline
     home = _overlay_owner_home(Path(_canonical_home(profile_home)))
     requested = False
     child = None
@@ -445,12 +450,19 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             # The install-root marker also covers profiles.
             if _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}):
                 return _fenced_verdict(home, remaining(deadline))
+            # Sampled before every probe, so even a first probe that spends the whole budget on a
+            # starved owner's control loop is followed by a progress verdict. A progressing owner
+            # moves this loop's deadline, and a macOS launchd job's, whose poll() would otherwise stop
+            # reporting an exit at the old one.
+            deadline = runway.extend((home, child_home), child)
+            if isinstance(child, GatewayJob):
+                child.extend_deadline(deadline)
             # Poll BEFORE discovering: an exit observed first, then "absent", cannot be a child that
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None
             observed = _observe_replacing_stale(home, deadline, replaced)
             if observed.reason_code == "control_timeout":
-                return GatewayDiscovery("starting", reason_code="deadline")
+                continue  # the probe used its whole budget; the next one raises unless extended
             if observed.state == "draining" and observed.reason_code in _RETIRING:
                 retiring, requested, child = True, False, None
                 time.sleep(min(0.1, remaining(deadline)))

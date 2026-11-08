@@ -523,3 +523,51 @@ def test_dead_unmanaged_start_is_a_prompt_terminal_verdict(tmp_path, monkeypatch
     assert "RuntimeError: boot failed with key" in result.detail, result.detail
     assert secret not in result.detail and "OLD_RUN_TRACEBACK" not in result.detail
     assert "gateway-stdio.log" in result.detail
+
+
+
+@pytest.fixture
+def fast_runway(monkeypatch):
+    """A real StartRunway on a sub-second scale: base 0.5 s, 0.2 s windows, cap 5 s."""
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_progress as progress
+    monkeypatch.setattr(runtime, "DEFAULT_ENSURE_TIMEOUT", 0.5)
+    monkeypatch.setattr(progress, "PROGRESS_WINDOW_S", 0.2)
+    monkeypatch.setattr(progress, "_SAMPLE_EVERY_S", 0.05)
+    monkeypatch.setattr(progress, "_LEAD_S", 1.0)
+    monkeypatch.setattr(progress, "MAX_ADAPTIVE_TIMEOUT", 5.0)
+    monkeypatch.setattr(progress, "_starting_owner_pid", lambda homes, child: 4242)
+    monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
+    return runtime, progress
+
+
+def _first_probe_spends_the_budget(runtime, ready_after):
+    probes = []
+    start = time.monotonic()
+
+    def observe(home, deadline, replaced):
+        probes.append(time.monotonic() - start)
+        if len(probes) == 1:  # a starved owner's control loop: the probe uses the whole budget
+            time.sleep(max(0.0, deadline - time.monotonic()))  # health: allow HX013 -- the probe using its whole budget IS the case under test
+            return runtime.GatewayDiscovery("inaccessible", reason_code="control_timeout")
+        return runtime.GatewayDiscovery("ready" if time.monotonic() - start >= ready_after else "starting")
+    return observe, probes
+
+
+def test_a_progressing_owner_whose_first_probe_spends_the_budget_is_still_awaited(fast_runway, tmp_path,
+                                                                                  monkeypatch):
+    runtime, progress = fast_runway
+    observe, _ = _first_probe_spends_the_budget(runtime, ready_after=1.0)
+    monkeypatch.setattr(runtime, "_observe_replacing_stale", observe)
+    monkeypatch.setattr(progress, "_cpu_seconds", lambda pid: time.monotonic())  # always burning CPU
+    assert runtime.ensure_gateway_runtime(tmp_path).state == "ready"
+
+
+def test_a_stalled_owner_whose_probe_times_out_is_still_a_deadline(fast_runway, tmp_path, monkeypatch):
+    runtime, progress = fast_runway
+    observe, _ = _first_probe_spends_the_budget(runtime, ready_after=60.0)
+    monkeypatch.setattr(runtime, "_observe_replacing_stale", observe)
+    monkeypatch.setattr(progress, "_cpu_seconds", lambda pid: 2.0)  # stopped: no CPU progress
+    before = time.monotonic()
+    result = runtime.ensure_gateway_runtime(tmp_path)
+    assert (result.state, result.reason_code) == ("starting", "deadline")
+    assert time.monotonic() - before < 2.0
